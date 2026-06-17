@@ -44,8 +44,8 @@ if getattr(sys, "frozen", False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-BAZA_DIR = os.path.join(BASE_DIR, "baza")               # база товаров + история
-ZADANIYA_DIR = os.path.join(BASE_DIR, "zadaniya")       # входящие задания
+BAZA_DIR = os.path.join(BASE_DIR, "../baza")               # база товаров + история
+ZADANIYA_DIR = os.path.join(BASE_DIR, "../zadaniya")       # входящие задания
 ARHIV_DIR = os.path.join(ZADANIYA_DIR, "_arhiv")        # выполненные задания
 
 TOVARY_CSV = os.path.join(BAZA_DIR, "tovary.csv")
