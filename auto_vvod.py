@@ -11,7 +11,7 @@ auto_vvod.py  (v0.4)  — помощник ввода продукции в ст
     отсчёт больше не нужны.
   - Переключатель REZHIM_VVODA: "vboxmanage" (по умолчанию) / "pyautogui"
     (реальное железо) / "pydirectinput" (упрямые приложения).
-  - При старте проверяется наличие VirtualBoxVM.exe и что VM запущена.
+  - При старте проверяется наличие VBoxManage.exe и что VM запущена.
 
 ИЗ v0.3:
   - ЦИКЛ: скрипт не выключается после задания. Выполнил → перенёс файл задания
@@ -74,7 +74,7 @@ REZHIM_VVODA = "vboxmanage"
 
 # Для режима vboxmanage:
 IMYA_VM = "Xp"                 # имя виртуалки в VirtualBox (как в списке VirtualBox)
-VBOXMANAGE_PATH = r"C:\Program Files\Oracle\VirtualBox\VirtualBoxVM.exe"  # путь к VirtualBoxVM.exe
+VBOXMANAGE_PATH = r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"  # путь к VBoxManage.exe
 
 OBRATNYI_OTSCHET = 5           # секунд на переключение в окно (только pyautogui/pydirectinput)
 PAUZA_KLAVISHA = 0.05          # пауза между нажатиями
@@ -296,7 +296,7 @@ def proverit_rezhim():
     """Проверка готовности выбранного режима. Возвращает (ok, soobshchenie)."""
     if REZHIM_VVODA == "vboxmanage":
         if not os.path.isfile(VBOXMANAGE_PATH):
-            return False, (f"Не найден VirtualBoxVM.exe:\n  {VBOXMANAGE_PATH}\n"
+            return False, (f"Не найден VBoxManage.exe:\n  {VBOXMANAGE_PATH}\n"
                            "Исправьте VBOXMANAGE_PATH в настройках скрипта.")
         # Проверяем, что виртуалка запущена.
         try:
