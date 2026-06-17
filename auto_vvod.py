@@ -101,23 +101,38 @@ def normalize(s: str) -> str:
     return " ".join(s.lower().replace("/", " ").split())
 
 
+def prochitat_tekst(path):
+    """Прочитать текстовый файл в ЛЮБОЙ кодировке.
+    Сначала UTF-8 (и с BOM), потом Windows-1251 (блокнот на русской Windows),
+    в крайнем случае — с заменой нечитаемых байтов. Возвращает строку."""
+    for enc in ("utf-8-sig", "cp1251"):
+        try:
+            with open(path, encoding=enc) as f:
+                return f.read()
+        except UnicodeDecodeError:
+            continue
+    # Запасной вариант: не падаем, портящиеся символы заменяем.
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
 def zagruzit_bazu():
     """Загрузить базу товаров. Возвращает список dict: {pozitsiya, naimenovanie, ostatok}.
     Порядок строк в файле = порядок на экране программы."""
     if not os.path.isfile(TOVARY_CSV):
         return None
     tovary = []
-    with open(TOVARY_CSV, encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f, delimiter=";")
-        for row in reader:
-            name = (row.get("naimenovanie") or "").strip()
-            if not name:
-                continue
-            try:
-                ost = int((row.get("ostatok") or "0").strip() or 0)
-            except ValueError:
-                ost = 0
-            tovary.append({"naimenovanie": name, "ostatok": ost})
+    tekst = prochitat_tekst(TOVARY_CSV)
+    reader = csv.DictReader(tekst.splitlines(), delimiter=";")
+    for row in reader:
+        name = (row.get("naimenovanie") or "").strip()
+        if not name:
+            continue
+        try:
+            ost = int((row.get("ostatok") or "0").strip() or 0)
+        except ValueError:
+            ost = 0
+        tovary.append({"naimenovanie": name, "ostatok": ost})
     return tovary
 
 
@@ -188,8 +203,8 @@ def razobrat_zadanie(path):
     """Разобрать файл-задание. Возвращает (позиции, ошибки).
     Позиция = (название, количество). Формат строки: Название;Кол  или  Название Кол."""
     pozicii, oshibki = [], []
-    with open(path, encoding="utf-8-sig") as f:
-        for nomer, raw in enumerate(f, 1):
+    tekst = prochitat_tekst(path)
+    for nomer, raw in enumerate(tekst.splitlines(), 1):
             s = raw.strip()
             if not s or s.startswith("#"):
                 continue
