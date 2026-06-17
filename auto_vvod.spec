@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['auto_vvod_0.3_BASED.py'],
+    ['auto_vvod.py'],
     pathex=[],
     binaries=[],
     datas=[],

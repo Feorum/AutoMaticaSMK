@@ -1,4 +1,4 @@
-('C:\\Users\\proto\\IdeaProjects\\AutoMatica\\build\\auto_vvod\\PYZ-00.pyz',
+('C:\\Users\\proto\\IdeaProjects\\AutoMaticaSMK\\build\\auto_vvod\\PYZ-00.pyz',
  [('__future__',
    'C:\\Users\\proto\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\__future__.py',
    'PYMODULE'),
