@@ -24,13 +24,6 @@ from thefuzz import fuzz
 import subprocess
 from datetime import datetime
 
-from oformlenie_slovar import (
-    razobrat_stroku_zakaza,
-    izvlech_oformlenie,
-    OFORMLENIE_SINONIMY,
-    _norm as _norm_of,
-)
-
 pyautogui = None
 try:
     import pyautogui as _pyautogui
@@ -47,8 +40,8 @@ if getattr(sys, "frozen", False):
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-BAZA_DIR      = os.path.join(BASE_DIR, "baza")
-ZADANIYA_DIR  = os.path.join(BASE_DIR, "zadaniya")
+BAZA_DIR      = os.path.join(BASE_DIR, "../baza")
+ZADANIYA_DIR  = os.path.join(BASE_DIR, "../zadaniya")
 ARHIV_DIR     = os.path.join(ZADANIYA_DIR, "_arhiv")
 TOVARY_CSV    = os.path.join(BAZA_DIR, "tovary.csv")
 ISTORIYA_CSV  = os.path.join(BAZA_DIR, "istoriya.csv")
@@ -63,8 +56,7 @@ PAUZA_MEZHDU_POZICIYAMI = 0.15
 RAZMER_STRANICY      = 17
 SORTIROVAT_PO_STROKE = True
 KLAVISHA_PODTVERZHDENIYA = ""
-PORICHE_POISKA       = 0.4    # ниже этого товар вообще не попадает в кандидаты
-PORICHE_UVERENNO     = 0.5    # ниже этого — считаем «товара нет в базе» (не угадываем)
+PORICHE_POISKA       = 0.5
 PROVERYAT_OSTATOK    = True
 OPROS_PAPKI_SEK      = 2
 
@@ -169,16 +161,6 @@ CATEGORIES = {
     'паштет': ['паштет', 'паштетный', 'паштетная']
 }
 
-# Категорийные слова после чистки/стемминга — не различают товары
-# («колбаса» есть у сотни позиций). Исключаем их из «главного слова».
-KAT_PREFIXY = (
-    "колбас", "сосис", "сард", "паштет", "крыл", "издел",
-)
-
-def _kat_slovo(w: str) -> bool:
-    """Категорийное ли это слово (колбаса/колбаска/сосиски…)."""
-    return any(w.startswith(p) for p in KAT_PREFIXY)
-
 def get_product_category(text: str) -> str:
     """Определяет основную категорию продукта из строки."""
     text_lower = text.lower()
@@ -187,26 +169,13 @@ def get_product_category(text: str) -> str:
             return cat_name
     return ""
 
-# Слова-обёртки из заказов, которые не несут смысла для поиска
-# («Изделие колбасное Колбаса Молочная в/с вес» → «молочная в/с»).
-STOP_SLOVA = {
-    "изделие", "колбасное", "колбасные", "продукт", "продукция",
-    "вес", "весовой", "весовая", "весовые", "шт", "штук",
-    "нат", "об", "натоб", "натуральная", "оболочка",
-    # Сорта/типы — встречаются у многих товаров, шумят при сравнении
-    "вс", "всорт", "высший", "сорт", "категория",
-    "пк", "вк", "ск", "св", "вареная", "вареный", "мяк",
-}
-
 def clean_and_stem(text: str) -> str:
     """Удаляет мусор, знаки препинания и срезает окончания для точного сравнения."""
     if not text:
         return ""
-    # Удаляем знаки препинания, приводим к нижнему регистру.
-    # Однобуквенные токены (от «в/с», «к-са» → в,с,к) — шум, убираем.
+    # Удаляем знаки препинания, приводим к нижнему регистру
     text = re.sub(r'[^\w\s]', ' ', text.lower())
-    words = [w for w in text.split()
-             if w not in STOP_SLOVA and len(w) > 1]
+    words = text.split()
 
     # Простейший стемминг: срезаем падежные окончания (ая, ый, ые, ое, ую, а, ы)
     # Чтобы "неженка паштетный" и "неженка паштетная" стали одинаковыми
@@ -221,43 +190,18 @@ def clean_and_stem(text: str) -> str:
 
     return " ".join(stemmed_words)
 
-def _score_oformlenie(zapros_kanon: str, tovar_oform: str) -> float:
-    """Оценка совпадения ОФОРМЛЕНИЯ.
-    zapros_kanon — канон, извлечённый из строки заказа (или '').
-    tovar_oform  — поле oformlenie товара из базы.
-    Сильный различающий фактор для дубликатов: совпало = большой плюс,
-    различается = штраф."""
-    z = (zapros_kanon or "").strip()
-    v = (tovar_oform or "").strip()
-    if not z:
-        # В заказе оформление не распознано — не штрафуем, но и не помогаем.
+def _score_field(zapros: str, znachenie: str) -> float:
+    """Оценка совпадения одного поля (оформление или масса)."""
+    if not zapros:
         return 0.0
-    if not v:
-        # В заказе оформление есть, у товара поле пустое — лёгкий минус.
-        return -0.15
-    if _norm_of(z) == _norm_of(v):
-        return 0.6          # точное совпадение канона — решающий бонус
-    # Разные оформления — заметный штраф (чтобы отсеять чужой дубль).
-    return -0.4
-
-
-def _score_massa(zapros_massa: str, tovar_massa: str) -> float:
-    """Оценка совпадения МАССЫ (в граммах, строками)."""
-    z = (zapros_massa or "").strip()
-    v = (tovar_massa or "").strip()
-    if not z:
-        return 0.0
-    if not v:
-        return -0.1
-    # сравниваем как числа, если можно
-    try:
-        if int(float(z)) == int(float(v)):
-            return 0.5      # масса совпала — сильный бонус
-        return -0.35        # масса разная — штраф
-    except ValueError:
-        if _norm_of(z) == _norm_of(v):
-            return 0.5
-        return -0.25
+    if not znachenie:
+        return -0.3
+    nz, nv = clean_and_stem(zapros), clean_and_stem(znachenie)
+    if nz == nv:
+        return 0.2
+    if nz in nv or nv in nz:
+        return 0.1
+    return (fuzz.ratio(nz, nv) / 100.0) * 0.15 - 0.05
 
 
 def naiti_kandidatov(
@@ -266,31 +210,12 @@ def naiti_kandidatov(
         zapros_oformlenie: str = "",
         zapros_massa: str = "",
 ) -> list[tuple]:
-    """Найти позиции базы. Возвращает список (idx, товар, оценка, база).
+    """Найти позиции базы. Возвращает список (idx, товар, оценка)."""
 
-    база — это сходство ТОЛЬКО по названию (0..1), оно нужно, чтобы отличить
-    «товара нет в базе» от дубликатов. Оформление и масса часто вписаны
-    ВНУТРЬ названия заказа — извлекаем их и различаем однофамильцев."""
-
-    # Разбор строки заказа: вычленяем чистое имя + оформление + массу.
-    razbor = razobrat_stroku_zakaza(zapros)
-    chistoe_imya = razbor["imya"] or zapros
-    # Явно переданные уточнения имеют приоритет над извлечёнными из текста.
-    if zapros_oformlenie:
-        of_kanon, _, _ = izvlech_oformlenie(zapros_oformlenie)
-        of_kanon = of_kanon or zapros_oformlenie
-    else:
-        of_kanon = razbor["oformlenie"]
-    massa = zapros_massa or razbor["massa"]
-
-    # Если в заказе НЕТ ни оформления, ни массы — базовое правило:
-    # предпочитаем вариант без оформления и без массы («обычный» товар).
-    net_utochneniya = (not of_kanon) and (not massa)
-
-    # Определяем категорию запроса по ПОЛНОМУ тексту (надёжнее).
+    # Определяем категорию запроса клиента (например, "сардельки")
     zapros_cat = get_product_category(zapros)
 
-    nz = clean_and_stem(chistoe_imya)
+    nz = clean_and_stem(zapros)
     if not nz:
         return []
 
@@ -303,55 +228,35 @@ def naiti_kandidatov(
 
         # --- ЖЕСТКАЯ ПРОВЕРКА КАТЕГОРИИ ---
         tovar_cat = get_product_category(naim)
+        # Если категории определились и они РАЗНЫЕ (Сардельки vs Крылышки) — пропускаем товар
         if zapros_cat and tovar_cat and zapros_cat != tovar_cat:
             continue
 
         # --- ОЦЕНКА СХОДСТВА НАЗВАНИЙ ЧЕРЕЗ THEFUZZ ---
         ts_ratio = fuzz.token_set_ratio(nz, nn) / 100.0
         sort_ratio = fuzz.token_sort_ratio(nz, nn) / 100.0
+
         base = max(ts_ratio, sort_ratio)
 
+        # Бонусы за совпадения
         if nz == nn:
             base = max(base, 1.0)
         elif nz in nn:
             base = max(base, 0.9 + 0.1 * (len(nz) / max(len(nn), 1)))
 
-        # Сколько ЗНАЧИМЫХ слов товара нашлось в запросе.
-        # Значимые = не категорийные и длиной ≥ 4 («обеденн», «мортаделл»).
-        zw = [w for w in nz.split() if len(w) >= 4 and not _kat_slovo(w)]
-        nw = [w for w in nn.split() if len(w) >= 4 and not _kat_slovo(w)]
-        if nw:
-            sovpalo = sum(
-                1 for wn in nw
-                if any(fuzz.ratio(wn, wz) >= 85 for wz in zw)
-            )
-            dolya = sovpalo / len(nw)   # доля слов товара, попавших в запрос
-            lishnie = len(nw) - sovpalo  # значимые слова товара, которых НЕТ в заказе
-            # Бонус только когда ВСЕ значимые слова товара есть в заказе
-            # И у товара нет лишних значимых слов.
-            if dolya >= 0.99 and lishnie == 0:
-                base = max(base, 0.85)
-            elif lishnie >= 1:
-                # У товара есть значимое слово, которого нет в заказе
-                # («Голяшка» при заказе «Обеденная») — это другой товар.
-                base = min(base, 0.55)
-            elif dolya < 0.5:
-                base = min(base, 0.55)
-
+        # Если в запросе было "премиум плотные", а в базе просто "сосиски сливочные",
+        # то fuzz.token_sort_ratio будет очень низким (~0.4).
+        # Благодаря этому "Сосиски плотные" не пройдут этот порог.
         if base < PORICHE_POISKA:
             continue
 
-        # Уточнение по оформлению и массе — решающее для дубликатов.
+        # Уточнение по оформлению и массе
         score = (base
-                 + _score_oformlenie(of_kanon, t["oformlenie"])
-                 + _score_massa(massa,         t["massa"]))
+                 + _score_field(zapros_oformlenie, t["oformlenie"])
+                 + _score_field(zapros_massa,       t["massa"]))
+        rez.append((idx, t, score))
 
-        # Базовое правило: нет уточнения → вариант без оформления/массы выше.
-        if net_utochneniya and not t["oformlenie"] and not t["massa"]:
-            score += 0.1
-
-        rez.append((idx, t, score, base))
-
+    # Сортировка по score (индекс 2 в кортеже) в порядке убывания
     rez.sort(key=lambda x: x[2], reverse=True)
     return rez
 
@@ -585,60 +490,19 @@ def obrabotat_zadanie(path: str, tovary: list[dict]) -> bool:
     # ── Сопоставление со базой ──
     plan: list[dict] = []
     ne_naideno: list  = []
-    vybor: list = []   # дубликаты, где нужен выбор оператора по цифрам
     for name, oform, massa, kol in pozicii:
         kand = naiti_kandidatov(name, tovary, oform, massa)
-        # Нет кандидатов ИЛИ лучшее сходство по имени слишком низкое
-        # → считаем, что товара нет в базе (не угадываем чужой).
-        if not kand or kand[0][3] < PORICHE_UVERENNO:
+        if not kand:
             ne_naideno.append((name, oform, massa, kol))
             continue
-        idx, t, score, base = kand[0]
-        # Дубликаты: выбор нужен ТОЛЬКО когда близкие кандидаты — это
-        # ОДИН и тот же товар (совпадает очищенное имя), различающийся
-        # только оформлением/массой. Разные товары с общим словом не считаются.
-        imya_t = clean_and_stem(t["naimenovanie"])
-        blizkie = [k for k in kand
-                   if k[2] > score - 0.05
-                   and clean_and_stem(k[1]["naimenovanie"]) == imya_t]
-        if len(blizkie) > 1:
-            varianty = [(k[0], k[1]) for k in blizkie][:6]
-            vybor.append({"name": name, "oform": oform, "massa": massa,
-                          "kol": int(kol), "varianty": varianty})
-            continue
-        plan.append({"idx": idx, "t": t, "kol": int(kol)})
-
-    # ── ВЫБОР ПО ЦИФРАМ для неоднозначных (ДО начала ввода) ──
-    if vybor:
-        print("\n" + "=" * 64)
-        print("  НУЖЕН ВЫБОР: несколько подходящих товаров")
-        print("  Укажите номер варианта (или 0 = пропустить позицию).")
-        print("=" * 64)
-        for v in vybor:
-            ut = " | ".join(x for x in [v["oform"], v["massa"]] if x)
-            print(f"\n  ЗАКАЗ: {v['name']}"
-                  f"{' | ' + ut if ut else ''} = {v['kol']}")
-            for n, (cidx, tv) in enumerate(v["varianty"], 1):
-                print(f"    [{n}] стр {cidx+1}: {format_tovar(tv)}  "
-                      f"(ост {tv['ostatok']})")
-            while True:
-                vyb = input("  Ваш выбор (цифра, Enter=1, 0=пропуск): ").strip()
-                if vyb == "":
-                    vyb = "1"
-                if not vyb.isdigit():
-                    print("    Введите число.")
-                    continue
-                num = int(vyb)
-                if num == 0:
-                    print("    Позиция пропущена (введёте вручную).")
-                    ne_naideno.append((v["name"], v["oform"], v["massa"], v["kol"]))
-                    break
-                if 1 <= num <= len(v["varianty"]):
-                    cidx, tv = v["varianty"][num - 1]
-                    plan.append({"idx": cidx, "t": tv, "kol": v["kol"]})
-                    print(f"    → выбрано: стр {cidx+1} {format_tovar(tv)}")
-                    break
-                print(f"    Нет такого номера (1..{len(v['varianty'])}).")
+        idx, t, score = kand[0]
+        ambig = (len(kand) > 1 and kand[1][2] > score - 0.05)
+        plan.append({
+            "idx":   idx,
+            "t":     t,
+            "kol":   int(kol),
+            "ambig": ambig,
+        })
 
     if SORTIROVAT_PO_STROKE:
         plan.sort(key=lambda x: x["idx"])
@@ -651,7 +515,7 @@ def obrabotat_zadanie(path: str, tovary: list[dict]) -> bool:
         t    = p["t"]
         label = format_tovar(t)
         rez_mark = " [R]" if t["rezerv"] else ""
-        pometka   = ""
+        pometka   = "  [похожие есть!]" if p["ambig"] else ""
         ost       = t["ostatok"]
         posle     = ost - p["kol"]
 

@@ -1,9 +1,9 @@
 @echo off
-title Sborka EXE (v0.3)
+title Sborka EXE (v0.5)
 cd /d "%~dp0"
 
 echo ============================================================
-echo   Sborka auto_vvod.exe  (v0.3: cikl + baza + istoriya)
+echo   Sborka auto_vvod.exe  (v0.5: cikl + baza + istoriya)
 echo ============================================================
 echo.
 echo Tekushaya papka: %CD%
@@ -22,17 +22,22 @@ set "SCRIPT="
 for %%F in (auto_vvod*.py) do if not defined SCRIPT set "SCRIPT=%%F"
 if not defined SCRIPT goto NO_SCRIPT
 echo Nayden: %SCRIPT%
+if not exist "oformlenie_slovar.py" goto NO_MODULE
+echo Modul oformlenie_slovar.py - na meste.
 echo.
 
 REM --- [3/5] Zavisimosti ---
-echo [3/5] Ustanovka pyinstaller i pyautogui...
-python -m pip install --upgrade pyinstaller pyautogui
+echo [3/5] Ustanovka pyinstaller, pyautogui, thefuzz...
+python -m pip install --upgrade pyinstaller pyautogui thefuzz
 if %errorlevel% neq 0 goto NO_DEPS
 echo.
 
 REM --- [4/5] Sborka exe ---
+REM oformlenie_slovar.py podtyanetsya avtomaticheski (import v skripte).
+REM thefuzz dobavlyaem v hidden-import na vsyakiy sluchay.
 echo [4/5] Sborka exe...
-python -m PyInstaller --onefile --console --clean --name auto_vvod "%SCRIPT%"
+python -m PyInstaller --onefile --console --clean --name auto_vvod ^
+  --hidden-import thefuzz --hidden-import oformlenie_slovar "%SCRIPT%"
 if %errorlevel% neq 0 goto NO_BUILD
 echo.
 
@@ -71,6 +76,12 @@ goto END
 echo.
 echo [ERROR] Ryadom net fayla auto_vvod*.py
 echo Polozhite etot .bat v tu zhe papku, gde skript.
+goto END
+
+:NO_MODULE
+echo.
+echo [ERROR] Ryadom net fayla oformlenie_slovar.py
+echo On nuzhen dlya raboty poiska. Polozhite ego ryadom s auto_vvod.py.
 goto END
 
 :NO_DEPS
