@@ -2,11 +2,11 @@
 
 
 a = Analysis(
-    ['auto_vvod.py'],
+    ['auto_vvod_v.0.5_stable.py'],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['thefuzz', 'oformlenie_slovar'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

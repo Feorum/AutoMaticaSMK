@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-auto_vvod.py  (v0.5)
+auto_vvod.0.56.py  (v0.5)
 
 НОВОЕ В v0.5:
   - Сброс курсора: 20× PageUp в начале каждого задания → tek_poz = 0.
