@@ -16,6 +16,7 @@ main_gui.py  —  единый GUI для авто-ввода продукции
 
 pip install pandas openpyxl
 """
+from __future__ import annotations
 
 import os
 import sys
@@ -41,14 +42,14 @@ ARHIV_DIR    = ZADANIYA_DIR / "_arhiv"
 TOVARY_CSV   = BAZA_DIR / "tovary.csv"
 ISTORIYA_CSV = BAZA_DIR / "istoriya.csv"
 MATCHING_CSV = BAZA_DIR / "matching.csv"
+ZAKAZY_DIR   = BASE_DIR / "zakazy"   # сохранённые именованные заказы
 
 # ── Настройки ввода ───────────────────────────────────────────────
 REZHIM_VVODA     = "vboxmanage"
 IMYA_VM          = "Xp"
 VBOXMANAGE_PATH  = r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
-SBROS_ZAPAS      = 30        # запас нажатий ↑ сверх числа товаров при сбросе курсора
-SBROS_PAGEUP     = 20        # (больше не используется — оставлено для совместимости)
-RAZMER_STRANICY  = 17        # (больше не используется — навигация только стрелками)
+SBROS_ZAPAS      = 5         # запас нажатий PageUp при сбросе курсора наверх
+RAZMER_STRANICY  = 17        # сколько строк сдвигает PageUp/PageDown (регулируется в программе)
 PAUZA_KLAVISHA   = 0.05
 PAUZA_MEZHDU     = 0.15
 SORTIROVAT       = True
@@ -64,6 +65,9 @@ CLR_STRIPE1 = "#ffffff"
 CLR_STRIPE2 = "#eef2f8"
 CLR_MISS    = "#fff0f0"   # фон строки «не найдено»
 CLR_MULTI   = "#fff8e0"   # фон строки «несколько вариантов»
+CLR_REZERV  = "#e8f0ff"   # фон строки «резерв»
+CLR_TOV_ODD = "#ffffff"
+CLR_TOV_EVN = "#f0f4f8"
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  БИЗНЕС-ЛОГИКА (упрощённые копии из auto_vvod + matching)       ║
@@ -96,12 +100,14 @@ def zagruzit_bazu() -> list[dict]:
         except ValueError:
             ost = 0
         rezerv_raw = (row.get("rezerv") or "0").strip().lower()
+        active_raw = (row.get("active")  or "1").strip().lower()
         tovary.append({
             "naimenovanie": name,
             "oformlenie":   (row.get("oformlenie") or "").strip(),
             "massa":        (row.get("massa") or "").strip(),
             "ostatok":      ost,
             "rezerv":       rezerv_raw in ("1", "yes", "да", "true"),
+            "active":       active_raw not in ("0", "no", "нет", "false"),
         })
     return tovary
 
@@ -110,10 +116,13 @@ def sohranit_bazu(tovary: list[dict]) -> None:
     BAZA_DIR.mkdir(parents=True, exist_ok=True)
     with open(TOVARY_CSV, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f, delimiter=";")
-        w.writerow(["pozitsiya", "naimenovanie", "oformlenie", "massa", "ostatok", "rezerv"])
+        w.writerow(["pozitsiya", "naimenovanie", "oformlenie", "massa",
+                    "ostatok", "rezerv", "active"])
         for i, t in enumerate(tovary, 1):
-            w.writerow([i, t["naimenovanie"], t["oformlenie"], t["massa"],
-                        t["ostatok"], "1" if t["rezerv"] else "0"])
+            w.writerow([i, t["naimenovanie"], t.get("oformlenie",""), t.get("massa",""),
+                        t.get("ostatok",0),
+                        "1" if t.get("rezerv") else "0",
+                        "1" if t.get("active", True) else "0"])
 
 
 def zapisat_istoriyu(zapisi: list) -> None:
@@ -435,18 +444,19 @@ def nazhat_klavishu(key: str) -> None:
     time.sleep(PAUZA_KLAVISHA)
 
 def peremestit_kursor(tek: int, cel: int) -> None:
-    """Перемещает курсор ТОЛЬКО стрелками (по 1 строке).
-
-    PageDown/PageUp БОЛЬШЕ НЕ ИСПОЛЬЗУЕМ: в старой программе
-    «страница» может быть не ровно RAZMER_STRANICY строк, и ошибка
-    накапливается — курсор уезжает и вводятся не те товары.
-    Стрелка всегда двигает ровно на 1 строку — это надёжно.
+    """Перемещает курсор: крупные прыжки PageUp/PageDown
+    (1 страница = RAZMER_STRANICY строк), остаток — стрелками.
+    RAZMER_STRANICY регулируется прямо в программе (поле «Строк в странице»).
     """
     delta = cel - tek
     if delta == 0:
         return
-    arr = "down" if delta > 0 else "up"
-    for _ in range(abs(delta)):
+    pg  = "pagedown" if delta > 0 else "pageup"
+    arr = "down"     if delta > 0 else "up"
+    stranica = RAZMER_STRANICY if RAZMER_STRANICY > 0 else 17
+    for _ in range(abs(delta) // stranica):
+        nazhat_klavishu(pg)
+    for _ in range(abs(delta) % stranica):
         nazhat_klavishu(arr)
 
 def vvesti_kolichestvo(kol: str) -> None:
@@ -489,6 +499,8 @@ class App(tk.Tk):
         self.plan_rows: list[dict] = []
         self._vvod_thread: threading.Thread | None = None
         self._stop_vvod = threading.Event()
+        self._current_zakaz_name: str = ""   # имя текущего заказа
+        self._current_path: str = ""
 
         self._build_ui()
         self._reload_baza()
@@ -504,11 +516,18 @@ class App(tk.Tk):
         self.tab_slovar  = ttk.Frame(nb)
         self.tab_zhurnal = ttk.Frame(nb)
 
+        self.tab_ruchnoy  = ttk.Frame(nb)
+        self.tab_tovary    = ttk.Frame(nb)
+
         nb.add(self.tab_zakaz,   text="  📋 Заказ  ")
+        nb.add(self.tab_ruchnoy, text="  ✏️ Ввод заказа  ")
+        nb.add(self.tab_tovary,  text="  📦 Список товаров  ")
         nb.add(self.tab_slovar,  text="  📖 Словарь  ")
         nb.add(self.tab_zhurnal, text="  📜 Журнал  ")
 
         self._build_tab_zakaz()
+        self._build_tab_ruchnoy()
+        self._build_tab_tovary()
         self._build_tab_slovar()
         self._build_tab_zhurnal()
 
@@ -521,13 +540,22 @@ class App(tk.Tk):
         top = ttk.LabelFrame(f, text="Файл задания", padding=6)
         top.pack(fill="x", padx=6, pady=(6, 2))
 
-        ttk.Button(top, text="📂 Открыть Excel…", command=self._otkryt_excel).grid(row=0, column=0, padx=(0,4))
-        ttk.Button(top, text="📂 Открыть TXT…",   command=self._otkryt_txt).grid(row=0, column=1, padx=(0,4))
-        ttk.Button(top, text="📂 Из папки zadaniya…", command=self._otkryt_iz_papki).grid(row=0, column=2, padx=(0,8))
+        ttk.Button(top, text="📂 Excel…",    command=self._otkryt_excel).grid(row=0, column=0, padx=(0,3))
+        ttk.Button(top, text="📂 TXT…",      command=self._otkryt_txt).grid(row=0, column=1, padx=(0,3))
+        ttk.Button(top, text="📂 zadaniya…", command=self._otkryt_iz_papki).grid(row=0, column=2, padx=(0,3))
+        ttk.Button(top, text="📁 Открыть заказ…", command=self._otkryt_sohranenny).grid(row=0, column=3, padx=(0,8))
 
-        self.lbl_file = ttk.Label(top, text="Файл не выбран", foreground="#777", width=55)
-        self.lbl_file.grid(row=0, column=3, sticky="ew")
-        top.columnconfigure(3, weight=1)
+        self.lbl_file = ttk.Label(top, text="Файл не выбран", foreground="#777", width=35)
+        self.lbl_file.grid(row=0, column=4, sticky="ew")
+        top.columnconfigure(4, weight=1)
+
+        # Название заказа
+        ttk.Label(top, text="Название заказа:").grid(row=1, column=0, sticky="w", pady=(4,0))
+        self.zakaz_name_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.zakaz_name_var, width=40).grid(
+            row=1, column=1, columnspan=3, sticky="ew", padx=(0,4), pady=(4,0))
+        ttk.Button(top, text="💾 Сохранить заказ", command=self._sohranit_zakaz).grid(
+            row=1, column=4, sticky="w", pady=(4,0))
 
         # Статус базы и VM
         info = ttk.Frame(f)
@@ -538,6 +566,16 @@ class App(tk.Tk):
         self.lbl_vm_stat.pack(side="left")
         ttk.Button(info, text="↺ Проверить VM", command=self._check_vm).pack(side="left", padx=8)
         ttk.Button(info, text="↺ Перезагрузить базу", command=self._reload_baza).pack(side="left")
+
+        # Регулировка размера страницы (сколько строк сдвигает PageUp/PageDown)
+        ttk.Label(info, text="Строк в странице:").pack(side="left", padx=(20, 2))
+        self.stranica_var = tk.IntVar(value=RAZMER_STRANICY)
+        sp = ttk.Spinbox(info, from_=1, to=99, width=4,
+                         textvariable=self.stranica_var,
+                         command=self._primenit_stranicu)
+        sp.pack(side="left")
+        sp.bind("<FocusOut>", lambda e: self._primenit_stranicu())
+        sp.bind("<Return>",   lambda e: self._primenit_stranicu())
 
         # Таблица плана
         tbl_frame = ttk.LabelFrame(f, text="План ввода  (строка заказа → товар в базе)", padding=4)
@@ -566,11 +604,12 @@ class App(tk.Tk):
         tbl_frame.columnconfigure(0, weight=1)
 
         # Теги цветов строк
-        self.tree_plan.tag_configure("ok",    background=CLR_STRIPE1)
-        self.tree_plan.tag_configure("ok2",   background=CLR_STRIPE2)
-        self.tree_plan.tag_configure("multi", background=CLR_MULTI)
-        self.tree_plan.tag_configure("miss",  background=CLR_MISS)
-        self.tree_plan.tag_configure("warn",  background="#fff0cc")  # score < 0.7
+        self.tree_plan.tag_configure("ok",     background=CLR_STRIPE1)
+        self.tree_plan.tag_configure("ok2",    background=CLR_STRIPE2)
+        self.tree_plan.tag_configure("multi",  background=CLR_MULTI)
+        self.tree_plan.tag_configure("miss",   background=CLR_MISS)
+        self.tree_plan.tag_configure("warn",   background="#fff0cc")
+        self.tree_plan.tag_configure("rezerv", background=CLR_REZERV)
 
         self.tree_plan.bind("<Double-1>", self._on_plan_dblclick)
 
@@ -753,6 +792,19 @@ class App(tk.Tk):
         self.lbl_vm_stat.config(text=f"VM: {msg}",
                                 foreground=CLR_OK if ok else CLR_ERR)
 
+    def _primenit_stranicu(self):
+        """Применить размер страницы из поля GUI (PageUp/PageDown)."""
+        global RAZMER_STRANICY
+        try:
+            v = int(self.stranica_var.get())
+        except (tk.TclError, ValueError):
+            return
+        if v < 1:
+            v = 1
+            self.stranica_var.set(1)
+        RAZMER_STRANICY = v
+        self._log(f"Размер страницы: PageUp/PageDown = {v} строк.")
+
     # ── ОТКРЫТИЕ ФАЙЛА ────────────────────────────────────────────
 
     def _otkryt_excel(self):
@@ -823,9 +875,14 @@ class App(tk.Tk):
                             break
                     continue
                 seen_idx.add(idx)
+                # Отключённый товар — пропускаем полностью
+                if not t.get("active", True):
+                    continue
+                # Резерв: не вводим автоматически, помечаем отдельно
+                st_val = "rezerv" if t.get("rezerv") else "ok"
                 self.plan_rows.append({
                     "name": name, "oform": oform, "massa": massa, "kol": kol,
-                    "status": "ok", "idx": idx, "t": t, "varianty": [], "score": score,
+                    "status": st_val, "idx": idx, "t": t, "varianty": [], "score": score,
                 })
             else:
                 # Несколько вариантов — нужен выбор
@@ -849,7 +906,13 @@ class App(tk.Tk):
         ok_n = 0
         for i, p in enumerate(self.plan_rows, 1):
             st = p["status"]
-            if st == "ok":
+            if st == "rezerv":
+                tag        = "rezerv"
+                baza_label = format_tovar(p["t"]) + "  [РЕЗЕРВ]"
+                stroka     = str(p["idx"] + 1)
+                ost        = str(p["t"]["ostatok"])
+                stat_label = "📌 резерв"
+            elif st == "ok":
                 ok_n += 1
                 if p.get("score", 1.0) < 0.7:
                     tag = "warn"
@@ -880,9 +943,11 @@ class App(tk.Tk):
         ok    = sum(1 for p in self.plan_rows if p["status"] == "ok")
         multi = sum(1 for p in self.plan_rows if p["status"] == "multi")
         miss  = sum(1 for p in self.plan_rows if p["status"] == "miss")
+        rez   = sum(1 for p in self.plan_rows if p["status"] == "rezerv")
         total = len(self.plan_rows)
         self.lbl_plan_stat.config(
-            text=f"Всего: {total}  |  ✓ {ok}  |  ⚠ выбрать: {multi}  |  ✗ не найдено: {miss}",
+            text=(f"Всего: {total}  |  ✓ {ok}  |  📌 резерв: {rez}"
+                  f"  |  ⚠ выбрать: {multi}  |  ✗ не найдено: {miss}"),
             foreground=CLR_OK if miss == 0 and multi == 0 else CLR_WARN)
 
     def _update_start_btn(self):
@@ -1266,19 +1331,22 @@ class App(tk.Tk):
         self.after(0, _do)
 
     def _zapustit_vvod(self):
+        self._primenit_stranicu()   # взять актуальный размер страницы из поля
         ok_rows = [p for p in self.plan_rows if p["status"] == "ok"]
         if not ok_rows:
             messagebox.showwarning("Нет данных", "Нет готовых строк для ввода."); return
 
         multi = sum(1 for p in self.plan_rows if p["status"] == "multi")
         miss  = sum(1 for p in self.plan_rows if p["status"] == "miss")
-        if multi > 0 or miss > 0:
+        rez   = sum(1 for p in self.plan_rows if p["status"] == "rezerv")
+        if multi > 0 or miss > 0 or rez > 0:
             msg = []
+            if rez:   msg.append(f"📌 {rez} позиций — РЕЗЕРВ (добавить вручную!)")
             if multi: msg.append(f"⚠ {multi} строк требуют выбора (двойной клик)")
             if miss:  msg.append(f"✗ {miss} строк не найдено в базе")
             if not messagebox.askyesno(
-                "Неполный план",
-                "\n".join(msg) + f"\n\nВсё равно запустить ввод {len(ok_rows)} найденных строк?"):
+                "Внимание перед запуском",
+                "\n".join(msg) + f"\n\nЗапустить ввод {len(ok_rows)} автоматических строк?"):
                 return
 
         vm_ok, vm_msg = proverit_vm()
@@ -1309,20 +1377,32 @@ class App(tk.Tk):
         z_name = getattr(self, "_current_path", "задание")
         z_name = Path(z_name).name if z_name else "задание"
 
-        # Сброс курсора наверх — только стрелками (НАДЁЖНО).
-        # Нажимаем ↑ больше, чем всего строк в базе — курсор гарантированно
-        # упрётся в первую строку (лишние ↑ на верхней строке ничего не ломают).
-        sbros = len(self.tovary) + SBROS_ZAPAS
-        self._log(f"Сброс курсора: {sbros}× ↑ (наверх)...")
+        # Сброс курсора наверх — PageUp (1 страница = RAZMER_STRANICY строк).
+        # Число нажатий = с запасом, чтобы гарантированно упереться в 1-ю строку.
+        stranica = RAZMER_STRANICY if RAZMER_STRANICY > 0 else 17
+        sbros = (len(self.tovary) // stranica) + SBROS_ZAPAS
+        self._log(f"Сброс курсора: {sbros}× PageUp (наверх)...")
         for _ in range(sbros):
             if self._stop_vvod.is_set(): return
-            nazhat_klavishu("up")
+            nazhat_klavishu("pageup")
         self._log("Курсор на строке 1. Начинаю ввод...")
 
         tek_poz  = 0
         istoriya = []
-        teper    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         vvedeno  = 0
+
+        # Записать резервные позиции в историю как ручные
+        teper = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for p in self.plan_rows:
+            if p["status"] == "rezerv" and p["t"]:
+                t = p["t"]
+                istoriya.append([
+                    teper, z_name, p["idx"] + 1,
+                    t["naimenovanie"], t["oformlenie"], t["massa"],
+                    p["kol"], t["ostatok"], t["ostatok"],
+                    "РЕЗЕРВ — добавить вручную",
+                ])
+                self._log(f"  📌 РЕЗЕРВ: {t['naimenovanie']} = {p['kol']} — добавить вручную!")
 
         for n, p in enumerate(ok_rows, 1):
             if self._stop_vvod.is_set():
@@ -1367,6 +1447,535 @@ class App(tk.Tk):
             self.after(0, self._reload_zhurnal)
         else:
             self._log("Ничего не введено.")
+
+
+    # ╔══════════════════════════════════════════════════════════════╗
+    # ║  СОХРАНЕНИЕ / ЗАГРУЗКА ИМЕНОВАННЫХ ЗАКАЗОВ                  ║
+    # ╚══════════════════════════════════════════════════════════════╝
+
+    def _sohranit_zakaz(self):
+        """Сохранить текущий план как именованный заказ (TXT)."""
+        name = self.zakaz_name_var.get().strip()
+        if not name:
+            messagebox.showwarning("Нет названия", "Введите название заказа.")
+            return
+        pozicii = []
+        for p in self.plan_rows:
+            if p["status"] in ("ok", "rezerv", "multi"):
+                n_name = p["name"]
+                kol    = p["kol"]
+                pozicii.append(f"{n_name};{kol}")
+        if not pozicii:
+            messagebox.showwarning("Нет строк", "Нет позиций для сохранения.")
+            return
+        ZAKAZY_DIR.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r'[<>:"/\\|?*]', "_", name)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = ZAKAZY_DIR / f"{safe}__{stamp}.txt"
+        try:
+            with open(path, "w", encoding="utf-8-sig") as f:
+                f.write(f"# Заказ: {name}\n")
+                f.write("\n".join(pozicii))
+            self._log(f"💾 Заказ '{name}' сохранён: {path.name}")
+            messagebox.showinfo("Сохранено", f"Заказ сохранён:\n{path.name}")
+        except OSError as e:
+            messagebox.showerror("Ошибка", str(e))
+
+    def _otkryt_sohranenny(self):
+        """Открыть окно со списком сохранённых заказов."""
+        ZAKAZY_DIR.mkdir(parents=True, exist_ok=True)
+        files = sorted(ZAKAZY_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not files:
+            messagebox.showinfo("Нет заказов", f"Папка {ZAKAZY_DIR} пуста.")
+            return
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Сохранённые заказы")
+        dlg.geometry("620x380")
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="Двойной клик — открыть заказ:",
+                  font=("Arial", 9)).pack(anchor="w", padx=10, pady=(8, 2))
+
+        tree = ttk.Treeview(dlg, columns=("name", "dt", "lines"),
+                            show="headings", selectmode="browse")
+        tree.heading("name",  text="Название заказа")
+        tree.heading("dt",    text="Дата")
+        tree.heading("lines", text="Строк")
+        tree.column("name",  width=320)
+        tree.column("dt",    width=140, anchor="center")
+        tree.column("lines", width=55,  anchor="center")
+        vsb = ttk.Scrollbar(dlg, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=(0, 10))
+        vsb.pack(side="right", fill="y", pady=(0, 10), padx=(0, 10))
+
+        for fp in files:
+            try:
+                txt = prochitat_tekst(str(fp))
+                lines = [l for l in txt.splitlines() if l.strip() and not l.startswith("#")]
+                # Название из первой строки комментария или из имени файла
+                zname = fp.stem.rsplit("__", 1)[0].replace("_", " ")
+                mtime = datetime.fromtimestamp(fp.stat().st_mtime).strftime("%d.%m.%Y %H:%M")
+                tree.insert("", "end", iid=str(fp), values=(zname, mtime, len(lines)))
+            except Exception:
+                pass
+
+        def open_selected(event=None):
+            iid = tree.focus()
+            if not iid:
+                return
+            fp = Path(iid)
+            # Установить название
+            zname = fp.stem.rsplit("__", 1)[0].replace("_", " ")
+            self.zakaz_name_var.set(zname)
+            dlg.destroy()
+            self._zagruzit_zadanie(str(fp), "txt")
+
+        tree.bind("<Double-1>", open_selected)
+        ttk.Button(dlg, text="Открыть", command=open_selected).pack(pady=6)
+
+    # ╔══════════════════════════════════════════════════════════════╗
+    # ║  ВКЛАДКА: РУЧНОЙ ВВОД ЗАКАЗА                                ║
+    # ╚══════════════════════════════════════════════════════════════╝
+
+    def _build_tab_ruchnoy(self):
+        f = self.tab_ruchnoy
+
+        ttk.Label(f, text="Введите позиции заказа вручную. Формат строки:  Название;количество",
+                  foreground="#444").pack(anchor="w", padx=8, pady=(6, 2))
+
+        # Поле ввода названия
+        nf = ttk.LabelFrame(f, text="Название заказа", padding=4)
+        nf.pack(fill="x", padx=8, pady=(2, 4))
+        self.ruchnoy_name_var = tk.StringVar()
+        ttk.Entry(nf, textvariable=self.ruchnoy_name_var, width=50).pack(side="left", fill="x", expand=True)
+
+        # Таблица позиций
+        tbl = ttk.LabelFrame(f, text="Позиции заказа", padding=4)
+        tbl.pack(fill="both", expand=True, padx=8, pady=2)
+
+        cols = ("num", "naim", "kol")
+        self.tree_ruchnoy = ttk.Treeview(tbl, columns=cols, show="headings", selectmode="browse")
+        self.tree_ruchnoy.heading("num",  text="№");  self.tree_ruchnoy.column("num",  width=40,  anchor="center", stretch=False)
+        self.tree_ruchnoy.heading("naim", text="Наименование"); self.tree_ruchnoy.column("naim", width=480, stretch=True)
+        self.tree_ruchnoy.heading("kol",  text="Кол-во"); self.tree_ruchnoy.column("kol",  width=70,  anchor="center", stretch=False)
+        vsb = ttk.Scrollbar(tbl, orient="vertical", command=self.tree_ruchnoy.yview)
+        self.tree_ruchnoy.configure(yscrollcommand=vsb.set)
+        self.tree_ruchnoy.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        tbl.rowconfigure(0, weight=1); tbl.columnconfigure(0, weight=1)
+
+        self.tree_ruchnoy.tag_configure("odd",  background="#ffffff")
+        self.tree_ruchnoy.tag_configure("even", background="#eef2f8")
+        self.tree_ruchnoy.bind("<Double-1>", self._ruchnoy_edit_row)
+
+        # Панель добавления/редактирования
+        add_frame = ttk.LabelFrame(f, text="Добавить / изменить позицию", padding=6)
+        add_frame.pack(fill="x", padx=8, pady=2)
+
+        ttk.Label(add_frame, text="Наименование:").grid(row=0, column=0, sticky="w")
+        self.ruchnoy_naim_var = tk.StringVar()
+        naim_entry = ttk.Entry(add_frame, textvariable=self.ruchnoy_naim_var, width=46)
+        naim_entry.grid(row=0, column=1, sticky="ew", padx=4)
+
+        # Автодополнение из базы
+        self.ruchnoy_hint_lb = tk.Listbox(add_frame, height=4, font=("Arial", 9))
+        self.ruchnoy_hint_lb.grid(row=1, column=1, sticky="ew", padx=4, pady=(0, 2))
+        self.ruchnoy_hint_lb.bind("<ButtonRelease-1>", self._ruchnoy_pick_hint)
+        self.ruchnoy_naim_var.trace_add("write", self._ruchnoy_update_hints)
+
+        ttk.Label(add_frame, text="Количество:").grid(row=0, column=2, sticky="w", padx=(12, 0))
+        self.ruchnoy_kol_var = tk.StringVar(value="1")
+        ttk.Entry(add_frame, textvariable=self.ruchnoy_kol_var, width=8).grid(row=0, column=3, padx=4)
+
+        btn_f = ttk.Frame(add_frame)
+        btn_f.grid(row=0, column=4, padx=(8, 0))
+        ttk.Button(btn_f, text="➕ Добавить",  command=self._ruchnoy_dobavit).pack(side="left", padx=2)
+        ttk.Button(btn_f, text="✏️ Заменить", command=self._ruchnoy_zamenit).pack(side="left", padx=2)
+        ttk.Button(btn_f, text="🗑 Удалить",  command=self._ruchnoy_udalit).pack(side="left", padx=2)
+
+        add_frame.columnconfigure(1, weight=1)
+
+        # Кнопки управления порядком и действий
+        bot = ttk.Frame(f)
+        bot.pack(fill="x", padx=8, pady=(2, 8))
+        ttk.Button(bot, text="⬆ Вверх",       command=self._ruchnoy_up).pack(side="left", padx=2)
+        ttk.Button(bot, text="⬇ Вниз",        command=self._ruchnoy_down).pack(side="left", padx=2)
+        ttk.Button(bot, text="🗑 Очистить всё", command=self._ruchnoy_clear).pack(side="left", padx=8)
+        ttk.Button(bot, text="▶ Перенести в план и выполнить →",
+                   command=self._ruchnoy_v_plan).pack(side="right", padx=4)
+        ttk.Button(bot, text="💾 Сохранить заказ",
+                   command=self._ruchnoy_sohranit).pack(side="right", padx=4)
+
+        # Внутренние данные
+        self._ruchnoy_rows: list[tuple[str, str]] = []  # (naim, kol)
+
+    def _ruchnoy_refresh(self):
+        self.tree_ruchnoy.delete(*self.tree_ruchnoy.get_children())
+        for i, (naim, kol) in enumerate(self._ruchnoy_rows, 1):
+            tag = "odd" if i % 2 == 1 else "even"
+            self.tree_ruchnoy.insert("", "end", iid=str(i-1), tags=(tag,),
+                                     values=(i, naim, kol))
+
+    def _ruchnoy_update_hints(self, *_):
+        kw = _norm(self.ruchnoy_naim_var.get())
+        self.ruchnoy_hint_lb.delete(0, "end")
+        if len(kw) < 2:
+            return
+        matches = [t["naimenovanie"] for t in self.tovary
+                   if kw in _norm(t["naimenovanie"])][:8]
+        for m in matches:
+            self.ruchnoy_hint_lb.insert("end", m)
+
+    def _ruchnoy_pick_hint(self, _=None):
+        sel = self.ruchnoy_hint_lb.curselection()
+        if sel:
+            self.ruchnoy_naim_var.set(self.ruchnoy_hint_lb.get(sel[0]))
+            self.ruchnoy_hint_lb.delete(0, "end")
+
+    def _ruchnoy_dobavit(self):
+        naim = self.ruchnoy_naim_var.get().strip()
+        kol  = self.ruchnoy_kol_var.get().strip()
+        if not naim:
+            messagebox.showwarning("Пусто", "Введите наименование.", parent=self); return
+        if not kol.isdigit() or int(kol) <= 0:
+            messagebox.showwarning("Ошибка", "Количество должно быть целым числом > 0.", parent=self); return
+        self._ruchnoy_rows.append((naim, kol))
+        self._ruchnoy_refresh()
+        self.ruchnoy_naim_var.set("")
+        self.ruchnoy_kol_var.set("1")
+
+    def _ruchnoy_zamenit(self):
+        iid = self.tree_ruchnoy.focus()
+        if not iid:
+            messagebox.showwarning("Не выбрано", "Выберите строку для замены.", parent=self); return
+        naim = self.ruchnoy_naim_var.get().strip()
+        kol  = self.ruchnoy_kol_var.get().strip()
+        if not naim or not kol.isdigit():
+            messagebox.showwarning("Ошибка", "Заполните наименование и количество.", parent=self); return
+        self._ruchnoy_rows[int(iid)] = (naim, kol)
+        self._ruchnoy_refresh()
+
+    def _ruchnoy_edit_row(self, _=None):
+        iid = self.tree_ruchnoy.focus()
+        if not iid:
+            return
+        naim, kol = self._ruchnoy_rows[int(iid)]
+        self.ruchnoy_naim_var.set(naim)
+        self.ruchnoy_kol_var.set(kol)
+
+    def _ruchnoy_udalit(self):
+        iid = self.tree_ruchnoy.focus()
+        if not iid:
+            return
+        self._ruchnoy_rows.pop(int(iid))
+        self._ruchnoy_refresh()
+
+    def _ruchnoy_up(self):
+        iid = self.tree_ruchnoy.focus()
+        if not iid:
+            return
+        i = int(iid)
+        if i > 0:
+            self._ruchnoy_rows[i], self._ruchnoy_rows[i-1] = (
+                self._ruchnoy_rows[i-1], self._ruchnoy_rows[i])
+            self._ruchnoy_refresh()
+            self.tree_ruchnoy.focus(str(i-1))
+            self.tree_ruchnoy.selection_set(str(i-1))
+
+    def _ruchnoy_down(self):
+        iid = self.tree_ruchnoy.focus()
+        if not iid:
+            return
+        i = int(iid)
+        if i < len(self._ruchnoy_rows) - 1:
+            self._ruchnoy_rows[i], self._ruchnoy_rows[i+1] = (
+                self._ruchnoy_rows[i+1], self._ruchnoy_rows[i])
+            self._ruchnoy_refresh()
+            self.tree_ruchnoy.focus(str(i+1))
+            self.tree_ruchnoy.selection_set(str(i+1))
+
+    def _ruchnoy_clear(self):
+        if messagebox.askyesno("Очистить?", "Удалить все строки заказа?"):
+            self._ruchnoy_rows.clear()
+            self._ruchnoy_refresh()
+
+    def _ruchnoy_sohranit(self):
+        name = self.ruchnoy_name_var.get().strip()
+        if not name:
+            messagebox.showwarning("Нет названия", "Введите название заказа."); return
+        if not self._ruchnoy_rows:
+            messagebox.showwarning("Пусто", "Нет строк."); return
+        ZAKAZY_DIR.mkdir(parents=True, exist_ok=True)
+        safe  = re.sub(r'[<>:"/\\\\|?*]', "_", name)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path  = ZAKAZY_DIR / f"{safe}__{stamp}.txt"
+        with open(path, "w", encoding="utf-8-sig") as f:
+            f.write(f"# Заказ: {name}\n")
+            for naim, kol in self._ruchnoy_rows:
+                f.write(f"{naim};{kol}\n")
+        self._log(f"💾 Заказ '{name}' сохранён: {path.name}")
+        messagebox.showinfo("Сохранено", f"{path.name}")
+
+    def _ruchnoy_v_plan(self):
+        if not self._ruchnoy_rows:
+            messagebox.showwarning("Пусто", "Нет строк для переноса."); return
+        name = self.ruchnoy_name_var.get().strip()
+        if name:
+            self.zakaz_name_var.set(name)
+        pozicii = [(naim, "", "", kol) for naim, kol in self._ruchnoy_rows]
+        self._postroit_plan(pozicii)
+        self.nb.select(self.tab_zakaz)
+        self._log(f"Ручной заказ перенесён в план: {len(pozicii)} позиций")
+
+    # ╔══════════════════════════════════════════════════════════════╗
+    # ║  ВКЛАДКА: СПИСОК ТОВАРОВ (редактирование базы)              ║
+    # ╚══════════════════════════════════════════════════════════════╝
+
+    def _build_tab_tovary(self):
+        f = self.tab_tovary
+
+        ttk.Label(f, text="Список товаров — порядок строк = порядок в программе. Изменения сохраняются в tovary.csv.",
+                  foreground="#444").pack(anchor="w", padx=8, pady=(6, 0))
+
+        # Фильтр
+        ff = ttk.Frame(f)
+        ff.pack(fill="x", padx=8, pady=2)
+        ttk.Label(ff, text="🔍 Фильтр:").pack(side="left")
+        self.tov_filter_var = tk.StringVar()
+        self.tov_filter_var.trace_add("write", lambda *_: self._tov_filter())
+        ttk.Entry(ff, textvariable=self.tov_filter_var, width=28).pack(side="left", padx=4)
+        ttk.Label(ff, text="Показать:").pack(side="left", padx=(12, 2))
+        self.tov_show_var = tk.StringVar(value="все")
+        cb = ttk.Combobox(ff, textvariable=self.tov_show_var,
+                          values=["все", "активные", "резерв", "отключённые"],
+                          width=12, state="readonly")
+        cb.pack(side="left")
+        cb.bind("<<ComboboxSelected>>", lambda _: self._tov_filter())
+        self.lbl_tov_count = ttk.Label(ff, text="", foreground="#555")
+        self.lbl_tov_count.pack(side="right")
+
+        # Таблица
+        tbl = ttk.LabelFrame(f, text="Товары", padding=4)
+        tbl.pack(fill="both", expand=True, padx=8, pady=2)
+
+        cols = ("pos", "naim", "of", "massa", "ost", "rezerv", "active")
+        self.tree_tov = ttk.Treeview(tbl, columns=cols, show="headings", selectmode="browse")
+        heads  = {"pos":"№","naim":"Наименование","of":"Оформление",
+                  "massa":"Масса","ost":"Остаток","rezerv":"Резерв","active":"Вкл"}
+        widths = {"pos":42,"naim":290,"of":130,"massa":65,"ost":65,"rezerv":60,"active":40}
+        for c in cols:
+            self.tree_tov.heading(c, text=heads[c])
+            self.tree_tov.column(c, width=widths[c],
+                                 stretch=(c == "naim"),
+                                 anchor="center" if c in ("pos","ost","rezerv","active") else "w")
+        vsb = ttk.Scrollbar(tbl, orient="vertical",   command=self.tree_tov.yview)
+        hsb = ttk.Scrollbar(tbl, orient="horizontal", command=self.tree_tov.xview)
+        self.tree_tov.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree_tov.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tbl.rowconfigure(0, weight=1); tbl.columnconfigure(0, weight=1)
+
+        self.tree_tov.tag_configure("active",   background="#ffffff")
+        self.tree_tov.tag_configure("active2",  background="#eef2f8")
+        self.tree_tov.tag_configure("rezerv",   background=CLR_REZERV)
+        self.tree_tov.tag_configure("inactive", background="#e8e8e8", foreground="#888")
+
+        self.tree_tov.bind("<<TreeviewSelect>>", self._tov_on_select)
+        self.tree_tov.bind("<Double-1>",         self._tov_toggle_active)
+
+        # Панель редактирования
+        ep = ttk.LabelFrame(f, text="Редактировать / добавить товар", padding=6)
+        ep.pack(fill="x", padx=8, pady=2)
+
+        ttk.Label(ep, text="Наименование:").grid(row=0, column=0, sticky="w")
+        self.tov_naim_var = tk.StringVar()
+        ttk.Entry(ep, textvariable=self.tov_naim_var, width=34).grid(row=0, column=1, sticky="ew", padx=4)
+
+        ttk.Label(ep, text="Оформление:").grid(row=0, column=2, sticky="w", padx=(8,0))
+        self.tov_of_var = tk.StringVar()
+        ttk.Entry(ep, textvariable=self.tov_of_var, width=16).grid(row=0, column=3, padx=4)
+
+        ttk.Label(ep, text="Масса:").grid(row=0, column=4, sticky="w", padx=(4,0))
+        self.tov_massa_var = tk.StringVar()
+        ttk.Entry(ep, textvariable=self.tov_massa_var, width=7).grid(row=0, column=5, padx=4)
+
+        ttk.Label(ep, text="Остаток:").grid(row=1, column=0, sticky="w", pady=(4,0))
+        self.tov_ost_var = tk.StringVar(value="0")
+        ttk.Entry(ep, textvariable=self.tov_ost_var, width=8).grid(row=1, column=1, sticky="w", padx=4, pady=(4,0))
+
+        self.tov_rezerv_var = tk.BooleanVar()
+        ttk.Checkbutton(ep, text="Резерв", variable=self.tov_rezerv_var).grid(
+            row=1, column=2, sticky="w", padx=(8,0), pady=(4,0))
+
+        self.tov_active_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(ep, text="Активен", variable=self.tov_active_var).grid(
+            row=1, column=3, sticky="w", pady=(4,0))
+
+        ep.columnconfigure(1, weight=1)
+
+        # Кнопки
+        bp = ttk.Frame(f)
+        bp.pack(fill="x", padx=8, pady=(2, 6))
+        ttk.Button(bp, text="⬆ Вверх",       command=self._tov_up).pack(side="left", padx=2)
+        ttk.Button(bp, text="⬇ Вниз",        command=self._tov_down).pack(side="left", padx=2)
+        ttk.Button(bp, text="➕ Добавить после выбранного",
+                   command=self._tov_dobavit).pack(side="left", padx=8)
+        ttk.Button(bp, text="✏️ Сохранить изменения",
+                   command=self._tov_izmenit).pack(side="left", padx=2)
+        ttk.Button(bp, text="🗑 Удалить",     command=self._tov_udalit).pack(side="left", padx=2)
+        ttk.Button(bp, text="↺⏺ Вкл/Выкл (двойной клик)",
+                   command=self._tov_toggle_active).pack(side="left", padx=8)
+        ttk.Button(bp, text="💾 Сохранить базу",
+                   command=self._tov_save).pack(side="right", padx=4)
+
+    def _tov_refresh(self, select_real_idx: int | None = None):
+        """Перерисовать таблицу товаров с учётом фильтра."""
+        self.tree_tov.delete(*self.tree_tov.get_children())
+        kw    = _norm(self.tov_filter_var.get())
+        show  = self.tov_show_var.get()
+        n_vis = 0
+        for real_idx, t in enumerate(self.tovary):
+            # Фильтр по режиму показа
+            is_rez  = t.get("rezerv", False)
+            is_act  = t.get("active", True)
+            if show == "активные"   and (not is_act or is_rez): continue
+            if show == "резерв"     and not is_rez: continue
+            if show == "отключённые" and is_act: continue
+            # Текстовый фильтр
+            if kw and kw not in _norm(t["naimenovanie"]): continue
+
+            if not is_act:
+                tag = "inactive"
+            elif is_rez:
+                tag = "rezerv"
+            else:
+                tag = "active" if n_vis % 2 == 0 else "active2"
+
+            rez_mark = "✓" if is_rez else ""
+            act_mark = "✓" if is_act else "✗"
+            self.tree_tov.insert("", "end", iid=str(real_idx), tags=(tag,),
+                                 values=(real_idx + 1, t["naimenovanie"],
+                                         t.get("oformlenie",""), t.get("massa",""),
+                                         t.get("ostatok", 0), rez_mark, act_mark))
+            n_vis += 1
+
+        self.lbl_tov_count.config(text=f"Показано: {n_vis} / {len(self.tovary)}")
+        if select_real_idx is not None:
+            iid = str(select_real_idx)
+            if self.tree_tov.exists(iid):
+                self.tree_tov.focus(iid)
+                self.tree_tov.selection_set(iid)
+                self.tree_tov.see(iid)
+
+    def _tov_filter(self):
+        self._tov_refresh()
+
+    def _tov_on_select(self, _=None):
+        iid = self.tree_tov.focus()
+        if not iid:
+            return
+        t = self.tovary[int(iid)]
+        self.tov_naim_var.set(t["naimenovanie"])
+        self.tov_of_var.set(t.get("oformlenie", ""))
+        self.tov_massa_var.set(t.get("massa", ""))
+        self.tov_ost_var.set(str(t.get("ostatok", 0)))
+        self.tov_rezerv_var.set(t.get("rezerv", False))
+        self.tov_active_var.set(t.get("active", True))
+
+    def _tov_toggle_active(self, _=None):
+        iid = self.tree_tov.focus()
+        if not iid:
+            return
+        t = self.tovary[int(iid)]
+        t["active"] = not t.get("active", True)
+        self._tov_refresh(int(iid))
+
+    def _tov_dobavit(self):
+        naim = self.tov_naim_var.get().strip()
+        if not naim:
+            messagebox.showwarning("Пусто", "Введите наименование."); return
+        try:
+            ost = int(self.tov_ost_var.get() or "0")
+        except ValueError:
+            ost = 0
+        new_t = {
+            "naimenovanie": naim,
+            "oformlenie":   self.tov_of_var.get().strip(),
+            "massa":        self.tov_massa_var.get().strip(),
+            "ostatok":      ost,
+            "rezerv":       self.tov_rezerv_var.get(),
+            "active":       self.tov_active_var.get(),
+        }
+        iid = self.tree_tov.focus()
+        if iid:
+            insert_after = int(iid) + 1
+            self.tovary.insert(insert_after, new_t)
+            self._tov_refresh(insert_after)
+        else:
+            self.tovary.append(new_t)
+            self._tov_refresh(len(self.tovary) - 1)
+        self._log(f"Добавлен товар: {naim!r}")
+
+    def _tov_izmenit(self):
+        iid = self.tree_tov.focus()
+        if not iid:
+            messagebox.showwarning("Не выбрано", "Выберите строку."); return
+        try:
+            ost = int(self.tov_ost_var.get() or "0")
+        except ValueError:
+            ost = 0
+        i = int(iid)
+        self.tovary[i].update({
+            "naimenovanie": self.tov_naim_var.get().strip(),
+            "oformlenie":   self.tov_of_var.get().strip(),
+            "massa":        self.tov_massa_var.get().strip(),
+            "ostatok":      ost,
+            "rezerv":       self.tov_rezerv_var.get(),
+            "active":       self.tov_active_var.get(),
+        })
+        self._tov_refresh(i)
+        self._log(f"Изменён товар #{i+1}: {self.tovary[i]['naimenovanie']!r}")
+
+    def _tov_udalit(self):
+        iid = self.tree_tov.focus()
+        if not iid:
+            return
+        i = int(iid)
+        naim = self.tovary[i]["naimenovanie"]
+        if not messagebox.askyesno("Удалить?", f"Удалить товар:\n{naim}\n\n"
+                                   "Внимание: это сдвинет номера ВСЕХ последующих позиций!"):
+            return
+        self.tovary.pop(i)
+        self._tov_refresh(min(i, len(self.tovary)-1) if self.tovary else None)
+        self._log(f"Удалён товар: {naim!r}")
+
+    def _tov_up(self):
+        iid = self.tree_tov.focus()
+        if not iid:
+            return
+        i = int(iid)
+        if i > 0:
+            self.tovary[i], self.tovary[i-1] = self.tovary[i-1], self.tovary[i]
+            self._tov_refresh(i-1)
+
+    def _tov_down(self):
+        iid = self.tree_tov.focus()
+        if not iid:
+            return
+        i = int(iid)
+        if i < len(self.tovary) - 1:
+            self.tovary[i], self.tovary[i+1] = self.tovary[i+1], self.tovary[i]
+            self._tov_refresh(i+1)
+
+    def _tov_save(self):
+        sohranit_bazu(self.tovary)
+        self._reload_baza()
+        self._tov_refresh()
+        self._log(f"✓ База товаров сохранена: {len(self.tovary)} позиций")
+        messagebox.showinfo("Сохранено", f"База обновлена: {len(self.tovary)} товаров.")
 
 
 # ── ТОЧКА ВХОДА ──────────────────────────────────────────────────
